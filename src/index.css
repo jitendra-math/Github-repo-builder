@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Mobile app jaisa feel dene ke liye extra tweaks */
+body {
+  background-color: #000000;
+  color: #f5f5f7;
+  -webkit-tap-highlight-color: transparent; /* Mobile par tap karne par jo blue box aata hai, use hatane ke liye */
+}
