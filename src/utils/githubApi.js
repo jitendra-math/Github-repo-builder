@@ -1,4 +1,3 @@
-// GitHub ko backend processing ke liye thoda sa saans lene ka waqt dena zaroori hai
 const wait = (ms) => new Promise(res => setTimeout(res, ms));
 
 export const createGithubRepoAndPush = async (token, repoName, files, onProgress) => {
@@ -10,14 +9,14 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
   }
 
   try {
-    // STEP 1: User Verification
+    // STEP 1: Verification
     onProgress('Verifying account...')
     const userRes = await fetch(`${baseUrl}/user`, { headers })
-    if (!userRes.ok) throw new Error('Invalid Token! Please check permissions (repo scope is required).')
+    if (!userRes.ok) throw new Error('Invalid Token! Please check permissions.')
     const userData = await userRes.json()
     const owner = userData.login
 
-    // STEP 2: Create Repository (auto_init ko false rakhenge taaki koi conflict na ho)
+    // STEP 2: Create Repo (auto_init: true zaroori hai Git DB initialize karne ke liye)
     onProgress('Creating repository...')
     const repoRes = await fetch(`${baseUrl}/user/repos`, {
       method: 'POST',
@@ -25,26 +24,30 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       body: JSON.stringify({ 
         name: repoName, 
         private: true, 
-        auto_init: false // README conflict se bachne ke liye ise false kiya hai
+        auto_init: true 
       }),
     })
     
     if (!repoRes.ok) {
         const errorData = await repoRes.json()
-        throw new Error(`Repo creation failed: ${errorData.message}`)
+        const specificError = errorData.errors ? errorData.errors[0].message : errorData.message;
+        throw new Error(`Repo creation failed: ${specificError}`)
     }
-    
-    // GitHub ko initialize hone ke liye 3 seconds ka buffer denge
+    const repoData = await repoRes.json()
+    // Branch ka naam dynamically le rahe hain (kuch accounts mein abhi bhi 'master' default hota hai)
+    const branch = repoData.default_branch || 'main';
+
+    // GitHub ko initial README aur database setup karne ke liye thoda time dena
     onProgress('Initializing Git database...')
     await wait(3000);
 
-    // STEP 3: Create Blobs (Har file ka content bhej rahe hain)
+    // STEP 3: Create Blobs
     const treeItems = []
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       onProgress(`Uploading files (${i + 1}/${files.length})...`)
       
-      // Path ko saaf karna (Leading slashes hatana)
+      // Slashes hata kar path clean karna
       const cleanPath = file.path.replace(/^\/+/, '');
       
       const blobRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/blobs`, {
@@ -70,31 +73,43 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       })
     }
 
-    // STEP 4: Build Tree (Yahan par asli error aa raha tha)
+    // STEP 4: Build Tree (Initial commit ki tree ko base banakar)
     onProgress('Building folder structure...')
+    
+    const refRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, { headers })
+    if (!refRes.ok) throw new Error(`Failed to find branch ${branch}.`);
+    const refData = await refRes.json()
+    const latestCommitSha = refData.object.sha
+
+    const commitResBase = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits/${latestCommitSha}`, { headers })
+    if (!commitResBase.ok) throw new Error('Failed to fetch base commit.');
+    const commitDataBase = await commitResBase.json()
+    const baseTreeSha = commitDataBase.tree.sha
+
     const treeRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/trees`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
+        base_tree: baseTreeSha, 
         tree: treeItems 
       }),
     })
     
     if (!treeRes.ok) {
         const treeErr = await treeRes.json();
-        // Ab aapko pata chalega ki GitHub ne mana kyun kiya
         throw new Error(`Tree creation failed: ${treeErr.message}`);
     }
     const treeData = await treeRes.json()
 
-    // STEP 5: Create Initial Commit
+    // STEP 5: Create Commit
     onProgress('Committing code...')
     const commitRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        message: 'Initial commit via JSS Mobile Uploader',
+        message: 'Initial commit via Mobile Uploader',
         tree: treeData.sha,
+        parents: [latestCommitSha],
       }),
     })
     
@@ -104,13 +119,12 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
     }
     const commitData = await commitRes.json()
 
-    // STEP 6: Create Main Branch Reference
+    // STEP 6: Update Branch Reference
     onProgress('Finalizing push...')
-    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/main`, {
-      method: 'POST', // Nayi repo hai isliye POST karke main branch banayenge
+    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
+      method: 'PATCH',
       headers,
       body: JSON.stringify({ 
-        ref: 'refs/heads/main',
         sha: commitData.sha 
       }),
     })
@@ -124,6 +138,6 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
 
   } catch (error) {
     console.error("GitHub API Error:", error)
-    throw error // Yeh error App.jsx mein badiya sa alert dikhayega
+    throw error
   }
 }
