@@ -1,10 +1,5 @@
-/**
- * GitHub API ke through repo create aur files push karne ka master function.
- * @param {string} token - User ka Personal Access Token
- * @param {string} repoName - Nayi repository ka naam
- * @param {Array} files - Array of objects { path: string, content: string (base64) }
- * @param {function} onProgress - Progress update karne ke liye callback
- */
+const wait = (ms) => new Promise(res => setTimeout(res, ms));
+
 export const createGithubRepoAndPush = async (token, repoName, files, onProgress) => {
   const baseUrl = 'https://api.github.com'
   const headers = {
@@ -14,102 +9,124 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
   }
 
   try {
-    // STEP 1: Get Authenticated User ki details (username nikalne ke liye)
+    // STEP 1: Verification
     onProgress('Verifying account...')
     const userRes = await fetch(`${baseUrl}/user`, { headers })
-    if (!userRes.ok) throw new Error('Invalid Token ya permissions missing hain.')
+    if (!userRes.ok) throw new Error('Invalid Token! Please check permissions.')
     const userData = await userRes.json()
     const owner = userData.login
 
-    // STEP 2: Create a New Private Repository (with auto_init so it has a main branch)
+    // STEP 2: Create Repo (auto_init: true zaroori hai taaki blobs upload ho sakein)
     onProgress('Creating repository...')
     const repoRes = await fetch(`${baseUrl}/user/repos`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
         name: repoName, 
-        private: true, // Personal use ke liye private best hai
-        auto_init: true // Yeh automatically initial commit aur default branch bana dega
+        private: true, 
+        auto_init: true // 100% required
       }),
     })
     
     if (!repoRes.ok) {
         const errorData = await repoRes.json()
-        throw new Error(`Repo creation failed: ${errorData.message}`)
+        const specificError = errorData.errors ? errorData.errors[0].message : errorData.message;
+        throw new Error(`Repo creation failed: ${specificError}`)
     }
+    
     const repoData = await repoRes.json()
-    const branch = repoData.default_branch // Usually 'main' hota hai
+    const branch = repoData.default_branch || 'main';
 
-    // STEP 3: Create Blobs for each file
+    onProgress('Initializing Git database...')
+    await wait(2500); // 2.5 seconds delay
+
+    // STEP 3: Create Blobs (Ab empty repo wala error nahi aayega)
     const treeItems = []
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      onProgress(`Uploading files (${i + 1}/${files.length})...`)
+    const safeFiles = files.filter(f => !f.path.includes('.git/') && !f.path.includes('.DS_Store'));
+
+    for (let i = 0; i < safeFiles.length; i++) {
+      const file = safeFiles[i]
+      onProgress(`Uploading files (${i + 1}/${safeFiles.length})...`)
+      
+      const cleanPath = file.path.replace(/^\/+/, '');
       
       const blobRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/blobs`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ 
-          content: file.content, 
-          encoding: 'base64' // Base64 zaroori hai images aur code dono handle karne ke liye
-        }),
+        body: JSON.stringify({ content: file.content, encoding: 'base64' }),
       })
-      const blobData = await blobRes.json()
       
-      // Tree item prepare kar rahe hain
+      if (!blobRes.ok) {
+        const blobErr = await blobRes.json();
+        throw new Error(`Blob upload failed for ${cleanPath}: ${blobErr.message}`);
+      }
+      
+      const blobData = await blobRes.json()
       treeItems.push({
-        path: file.path,
-        mode: '100644', // Standard file mode
+        path: cleanPath,
+        mode: '100644',
         type: 'blob',
         sha: blobData.sha,
       })
     }
 
-    // STEP 4: Naya Git Tree create karna (Yeh GitHub ko folder structure batayega)
+    // STEP 4: Build Tree (THE FIX: Yahan se 'base_tree' completely uda diya hai)
     onProgress('Building folder structure...')
     
-    // Pehle base tree ka SHA nikalenge taaki purani history merge ho sake
+    // Parent commit nikalna taaki history break na ho
     const refRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, { headers })
+    if (!refRes.ok) throw new Error(`Failed to find branch ${branch}.`);
     const refData = await refRes.json()
     const latestCommitSha = refData.object.sha
 
-    const commitResBase = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits/${latestCommitSha}`, { headers })
-    const commitDataBase = await commitResBase.json()
-    const baseTreeSha = commitDataBase.tree.sha
-
-    // Ab nayi tree push karenge
+    // Bina base_tree ke naya tree banana (Ab "Not Found" ka error impossible hai)
     const treeRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/trees`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
-        base_tree: baseTreeSha, 
-        tree: treeItems 
+        tree: treeItems // sirf nayi files pass kar rahe hain
       }),
     })
+    
+    if (!treeRes.ok) {
+        const treeErr = await treeRes.json();
+        throw new Error(`Tree creation failed: ${treeErr.message}`);
+    }
     const treeData = await treeRes.json()
 
-    // STEP 5: Create a new Commit
+    // STEP 5: Create Commit
     onProgress('Committing code...')
     const commitRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        message: 'Initial commit via Mobile Folder Uploader',
+        message: 'Initial commit via JSS Mobile Uploader',
         tree: treeData.sha,
-        parents: [latestCommitSha],
+        parents: [latestCommitSha], // Pehli README se jodne ke liye
       }),
     })
+    
+    if (!commitRes.ok) {
+      const commitErr = await commitRes.json();
+      throw new Error(`Commit failed: ${commitErr.message}`);
+    }
     const commitData = await commitRes.json()
 
-    // STEP 6: Update Branch Reference (Push)
-    onProgress('Pushing to main branch...')
-    await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
+    // STEP 6: Update Branch Reference
+    onProgress('Finalizing push...')
+    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
       method: 'PATCH',
       headers,
-      body: JSON.stringify({ sha: commitData.sha }),
+      body: JSON.stringify({ 
+        sha: commitData.sha 
+      }),
     })
+    
+    if (!pushRes.ok) {
+      const pushErr = await pushRes.json();
+      throw new Error(`Final push failed: ${pushErr.message}`);
+    }
 
-    // Final Repo ka URL return karenge
     return `https://github.com/${owner}/${repoName}`
 
   } catch (error) {
