@@ -1,5 +1,3 @@
-const wait = (ms) => new Promise(res => setTimeout(res, ms));
-
 export const createGithubRepoAndPush = async (token, repoName, files, onProgress) => {
   const baseUrl = 'https://api.github.com'
   const headers = {
@@ -9,22 +7,22 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
   }
 
   try {
-    // STEP 1: Verification
+    // STEP 1: Verify User
     onProgress('Verifying account...')
     const userRes = await fetch(`${baseUrl}/user`, { headers })
     if (!userRes.ok) throw new Error('Invalid Token! Please check permissions.')
     const userData = await userRes.json()
     const owner = userData.login
 
-    // STEP 2: Create Repo (auto_init: true zaroori hai Git DB initialize karne ke liye)
-    onProgress('Creating repository...')
+    // STEP 2: Create a COMPLETELY EMPTY Repo (auto_init: false)
+    onProgress('Creating empty repository...')
     const repoRes = await fetch(`${baseUrl}/user/repos`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
         name: repoName, 
         private: true, 
-        auto_init: true 
+        auto_init: false // Isko false hi rakhna hai taaki GitHub beech mein tang na adaye
       }),
     })
     
@@ -33,21 +31,17 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
         const specificError = errorData.errors ? errorData.errors[0].message : errorData.message;
         throw new Error(`Repo creation failed: ${specificError}`)
     }
-    const repoData = await repoRes.json()
-    // Branch ka naam dynamically le rahe hain (kuch accounts mein abhi bhi 'master' default hota hai)
-    const branch = repoData.default_branch || 'main';
 
-    // GitHub ko initial README aur database setup karne ke liye thoda time dena
-    onProgress('Initializing Git database...')
-    await wait(3000);
-
-    // STEP 3: Create Blobs
+    // STEP 3: Create Blobs (With Safety Filter)
     const treeItems = []
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      onProgress(`Uploading files (${i + 1}/${files.length})...`)
+    
+    // Faltu hidden files ko ignore karenge jo GitHub API ko block kar sakti hain
+    const safeFiles = files.filter(f => !f.path.includes('.git/') && !f.path.includes('.DS_Store'));
+
+    for (let i = 0; i < safeFiles.length; i++) {
+      const file = safeFiles[i]
+      onProgress(`Uploading files (${i + 1}/${safeFiles.length})...`)
       
-      // Slashes hata kar path clean karna
       const cleanPath = file.path.replace(/^\/+/, '');
       
       const blobRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/blobs`, {
@@ -61,7 +55,7 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       
       if (!blobRes.ok) {
         const blobErr = await blobRes.json();
-        throw new Error(`Upload failed for ${cleanPath}: ${blobErr.message}`);
+        throw new Error(`Blob upload failed for ${cleanPath}: ${blobErr.message}`);
       }
       
       const blobData = await blobRes.json()
@@ -73,24 +67,12 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       })
     }
 
-    // STEP 4: Build Tree (Initial commit ki tree ko base banakar)
-    onProgress('Building folder structure...')
-    
-    const refRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, { headers })
-    if (!refRes.ok) throw new Error(`Failed to find branch ${branch}.`);
-    const refData = await refRes.json()
-    const latestCommitSha = refData.object.sha
-
-    const commitResBase = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits/${latestCommitSha}`, { headers })
-    if (!commitResBase.ok) throw new Error('Failed to fetch base commit.');
-    const commitDataBase = await commitResBase.json()
-    const baseTreeSha = commitDataBase.tree.sha
-
+    // STEP 4: Build Root Tree (Bina kisi purane reference ke)
+    onProgress('Building root folder structure...')
     const treeRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/trees`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
-        base_tree: baseTreeSha, 
         tree: treeItems 
       }),
     })
@@ -101,15 +83,15 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
     }
     const treeData = await treeRes.json()
 
-    // STEP 5: Create Commit
+    // STEP 5: Create First "Root" Commit (Bina kisi parent ke)
     onProgress('Committing code...')
     const commitRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        message: 'Initial commit via Mobile Uploader',
-        tree: treeData.sha,
-        parents: [latestCommitSha],
+        message: 'Initial commit via JSS Mobile Uploader',
+        tree: treeData.sha
+        // Yahan 'parents' array intentionally nahi daala hai kyunki yeh pehla commit hai
       }),
     })
     
@@ -119,12 +101,13 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
     }
     const commitData = await commitRes.json()
 
-    // STEP 6: Update Branch Reference
-    onProgress('Finalizing push...')
-    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
-      method: 'PATCH',
+    // STEP 6: Create Main Branch and push
+    onProgress('Finalizing push to main branch...')
+    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs`, {
+      method: 'POST', // Nayi branch banane ke liye POST use hota hai
       headers,
       body: JSON.stringify({ 
+        ref: 'refs/heads/main',
         sha: commitData.sha 
       }),
     })
