@@ -1,4 +1,4 @@
-// GitHub ko initialize hone ke liye thoda waqt dene ke liye
+// GitHub ko backend processing ke liye thoda sa saans lene ka waqt dena zaroori hai
 const wait = (ms) => new Promise(res => setTimeout(res, ms));
 
 export const createGithubRepoAndPush = async (token, repoName, files, onProgress) => {
@@ -10,14 +10,14 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
   }
 
   try {
-    // STEP 1: User Verify
+    // STEP 1: User Verification
     onProgress('Verifying account...')
     const userRes = await fetch(`${baseUrl}/user`, { headers })
-    if (!userRes.ok) throw new Error('Invalid Token! Please check permissions.')
+    if (!userRes.ok) throw new Error('Invalid Token! Please check permissions (repo scope is required).')
     const userData = await userRes.json()
     const owner = userData.login
 
-    // STEP 2: Create Repo
+    // STEP 2: Create Repository (auto_init ko false rakhenge taaki koi conflict na ho)
     onProgress('Creating repository...')
     const repoRes = await fetch(`${baseUrl}/user/repos`, {
       method: 'POST',
@@ -25,7 +25,7 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       body: JSON.stringify({ 
         name: repoName, 
         private: true, 
-        auto_init: true 
+        auto_init: false // README conflict se bachne ke liye ise false kiya hai
       }),
     })
     
@@ -33,18 +33,19 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
         const errorData = await repoRes.json()
         throw new Error(`Repo creation failed: ${errorData.message}`)
     }
-    const repoData = await repoRes.json()
-    const branch = repoData.default_branch
+    
+    // GitHub ko initialize hone ke liye 3 seconds ka buffer denge
+    onProgress('Initializing Git database...')
+    await wait(3000);
 
-    // --- SMART ADDITION: Wait for GitHub to initialize ---
-    onProgress('Waiting for GitHub to initialize...')
-    await wait(2500); 
-
-    // STEP 3: Create Blobs
+    // STEP 3: Create Blobs (Har file ka content bhej rahe hain)
     const treeItems = []
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       onProgress(`Uploading files (${i + 1}/${files.length})...`)
+      
+      // Path ko saaf karna (Leading slashes hatana)
+      const cleanPath = file.path.replace(/^\/+/, '');
       
       const blobRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/blobs`, {
         method: 'POST',
@@ -56,42 +57,37 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       })
       
       if (!blobRes.ok) {
-        const err = await blobRes.json();
-        throw new Error(`Blob failed for ${file.path}: ${err.message}`);
+        const blobErr = await blobRes.json();
+        throw new Error(`Upload failed for ${cleanPath}: ${blobErr.message}`);
       }
       
       const blobData = await blobRes.json()
       treeItems.push({
-        path: file.path,
+        path: cleanPath,
         mode: '100644',
         type: 'blob',
         sha: blobData.sha,
       })
     }
 
-    // STEP 4: Build Tree
+    // STEP 4: Build Tree (Yahan par asli error aa raha tha)
     onProgress('Building folder structure...')
-    const refRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, { headers })
-    if (!refRes.ok) throw new Error('Could not find main branch yet. Try again.');
-    const refData = await refRes.json()
-    const latestCommitSha = refData.object.sha
-
-    const commitResBase = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits/${latestCommitSha}`, { headers })
-    const commitDataBase = await commitResBase.json()
-    const baseTreeSha = commitDataBase.tree.sha
-
     const treeRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/trees`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ 
-        base_tree: baseTreeSha, 
         tree: treeItems 
       }),
     })
-    if (!treeRes.ok) throw new Error('Tree creation failed.');
+    
+    if (!treeRes.ok) {
+        const treeErr = await treeRes.json();
+        // Ab aapko pata chalega ki GitHub ne mana kyun kiya
+        throw new Error(`Tree creation failed: ${treeErr.message}`);
+    }
     const treeData = await treeRes.json()
 
-    // STEP 5: Create Commit
+    // STEP 5: Create Initial Commit
     onProgress('Committing code...')
     const commitRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits`, {
       method: 'POST',
@@ -99,25 +95,35 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       body: JSON.stringify({
         message: 'Initial commit via JSS Mobile Uploader',
         tree: treeData.sha,
-        parents: [latestCommitSha],
       }),
     })
-    if (!commitRes.ok) throw new Error('Commit failed.');
+    
+    if (!commitRes.ok) {
+      const commitErr = await commitRes.json();
+      throw new Error(`Commit failed: ${commitErr.message}`);
+    }
     const commitData = await commitRes.json()
 
-    // STEP 6: Push to main
+    // STEP 6: Create Main Branch Reference
     onProgress('Finalizing push...')
-    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
-      method: 'PATCH',
+    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/main`, {
+      method: 'POST', // Nayi repo hai isliye POST karke main branch banayenge
       headers,
-      body: JSON.stringify({ sha: commitData.sha }),
+      body: JSON.stringify({ 
+        ref: 'refs/heads/main',
+        sha: commitData.sha 
+      }),
     })
-    if (!pushRes.ok) throw new Error('Final push to branch failed.');
+    
+    if (!pushRes.ok) {
+      const pushErr = await pushRes.json();
+      throw new Error(`Final push failed: ${pushErr.message}`);
+    }
 
     return `https://github.com/${owner}/${repoName}`
 
   } catch (error) {
     console.error("GitHub API Error:", error)
-    throw error // Yeh error App.jsx mein alert bankar dikhega
+    throw error // Yeh error App.jsx mein badiya sa alert dikhayega
   }
 }
