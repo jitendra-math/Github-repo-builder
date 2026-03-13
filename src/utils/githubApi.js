@@ -1,4 +1,4 @@
-// GitHub API thodi slow hoti hai repo banane ke baad, isliye wait function
+// GitHub API ke initial setup ke liye chota sa wait
 const wait = (ms) => new Promise(res => setTimeout(res, ms));
 
 export const createGithubRepoAndPush = async (token, repoName, files, onProgress) => {
@@ -25,7 +25,7 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       body: JSON.stringify({
         name: repoName,
         private: true,
-        auto_init: true 
+        auto_init: true // 100% required taaki blobs push ho sakein
       }),
     });
 
@@ -33,21 +33,17 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
         const errorData = await repoRes.json();
         throw new Error(`Repo creation failed: ${errorData.message}`);
     }
+    const repoData = await repoRes.json();
+    const branch = repoData.default_branch || 'main';
 
-    onProgress('Waiting for GitHub database to setup...');
-    await wait(4000); // 4 seconds ka pakka wait taaki GitHub backend ready ho jaye
+    onProgress('Warming up GitHub database...');
+    await wait(3000); 
 
-    // Repo ko dobara fetch karke asli default branch nikalna
-    const repoCheck = await fetch(`${baseUrl}/repos/${owner}/${repoName}`, { headers });
-    const repoCheckData = await repoCheck.json();
-    const branch = repoCheckData.default_branch || 'main';
-
-    // STEP 3: Create Blobs (Yahan hum paths ko saaf karenge aur hidden files hatayenge)
+    // STEP 3: Create Blobs (Har file path ko filter aur clean karna)
     const treeItems = [];
-    
     const safeFiles = files.filter(f => {
         const p = f.path.toLowerCase();
-        // .git, .DS_Store, aur __MACOSX jaise hidden folders ko block karna
+        // Faltu aur hidden files ko strict ignore
         return p && !p.includes('.git/') && !p.includes('.ds_store') && !p.includes('__macosx');
     });
 
@@ -55,7 +51,7 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       const file = safeFiles[i];
       onProgress(`Uploading files (${i + 1}/${safeFiles.length})...`);
 
-      // SUPER FIX: Path ko ekdum clean karna (kuch bhi ajeeb slashes hatana)
+      // Path ko properly clean karna
       const cleanPath = file.path.split('/').filter(Boolean).join('/');
 
       const blobRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/blobs`, {
@@ -78,25 +74,13 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
       });
     }
 
-    // STEP 4: Build Tree (Base tree ke upar naya tree banana)
-    onProgress('Fetching base tree...');
-    const refRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, { headers });
-    if (!refRes.ok) throw new Error(`Could not find branch ${branch}. GitHub API is delayed.`);
-    const refData = await refRes.json();
-    const latestCommitSha = refData.object.sha;
-
-    const commitResBase = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits/${latestCommitSha}`, { headers });
-    const commitDataBase = await commitResBase.json();
-    const baseTreeSha = commitDataBase.tree.sha;
-
-    onProgress('Building folder structure...');
+    // STEP 4: Build Tree (THE MAGIC: No Base Tree!)
+    onProgress('Building fresh folder structure...');
+    // Yahan humne base_tree bhejna band kar diya hai, jisse "Not Found" ka chakkar hi khatam ho gaya
     const treeRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/trees`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        base_tree: baseTreeSha,
-        tree: treeItems
-      }),
+      body: JSON.stringify({ tree: treeItems }), 
     });
 
     if (!treeRes.ok) {
@@ -105,15 +89,15 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
     }
     const treeData = await treeRes.json();
 
-    // STEP 5: Create Commit
+    // STEP 5: Create a "Root" Commit (No Parents)
     onProgress('Committing code...');
     const commitRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/commits`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        message: 'Initial project upload via Web App',
+        message: '🚀 Initial project upload via JSS Mobile Uploader',
         tree: treeData.sha,
-        parents: [latestCommitSha],
+        // DHYAN DEIN: Yahan 'parents' array nahi hai. Yeh ek fresh history banayega!
       }),
     });
 
@@ -123,17 +107,26 @@ export const createGithubRepoAndPush = async (token, repoName, files, onProgress
     }
     const commitData = await commitRes.json();
 
-    // STEP 6: Final Push
-    onProgress('Finalizing push...');
-    const pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
+    // STEP 6: Force Push to Branch
+    onProgress('Finalizing force push...');
+    let pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
       method: 'PATCH',
       headers,
-      body: JSON.stringify({ sha: commitData.sha }),
+      body: JSON.stringify({ sha: commitData.sha, force: true }), // FORCE TRUE laga diya
     });
 
+    // Fallback: Agar GitHub ne branch banayi hi nahi hai abhi tak, toh hum khud branch bana denge
     if (!pushRes.ok) {
-        const pushErr = await pushRes.json();
-        throw new Error(`Final push failed: ${pushErr.message}`);
+       pushRes = await fetch(`${baseUrl}/repos/${owner}/${repoName}/git/refs`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: commitData.sha }),
+       });
+       
+       if (!pushRes.ok) {
+          const pushErr = await pushRes.json();
+          throw new Error(`Final push failed: ${pushErr.message}`);
+       }
     }
 
     return `https://github.com/${owner}/${repoName}`;
